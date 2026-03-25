@@ -184,16 +184,21 @@ async def get_config_decrypted(workflow_id: str, identifier: Optional[str] = Non
     if identifier:
         params["identifier"] = identifier
 
-    try:
-        async with httpx.AsyncClient(headers=DASHBOARD_HEADERS, timeout=30) as client:
-            res = await client.get(f"{BASE_URL}/api/dev/config-decrypt", params=params)
-            res.raise_for_status()
-        return json.dumps(res.json()["data"], indent=2)
-    except Exception:
+    async with httpx.AsyncClient(headers=DASHBOARD_HEADERS, timeout=30) as client:
+        res = await client.get(f"{BASE_URL}/api/dev/config-decrypt", params=params)
+
+    if res.status_code == 404:
+        sys.stderr.write(
+            f"[get_config_decrypted] 404 for workflow='{workflow_id}' identifier='{identifier}' — "
+            "endpoint not available in this environment\n"
+        )
         return (
             "get_config_decrypted is only available in non-production environments. "
             "Use get_config to view non-secret config values."
         )
+
+    res.raise_for_status()
+    return json.dumps(res.json()["data"], indent=2)
 
 
 @mcp.tool()
