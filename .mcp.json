@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "workflow-pieces": {
+      "command": "uv",
+      "args": ["run", "python", "server.py"],
+      "cwd": "/Users/shipsy/Desktop/Work/Project/mcp"
+    }
+  }
+}
