@@ -9,4 +9,5 @@ dependencies = [
     "mcp[cli]>=1.0.0",
     "python-dotenv>=1.0.0",
     "redis>=5.0.0",
+    "cryptography>=42.0.0",
 ]

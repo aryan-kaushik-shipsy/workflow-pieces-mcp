@@ -25,6 +25,8 @@ import os
 import sys
 from typing import Optional
 
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -35,6 +37,7 @@ from mcp.server.fastmcp import FastMCP
 # ─── Config ───────────────────────────────────────────────────────────────────
 
 BASE_URL = os.getenv("WP_BASE_URL", "http://localhost:3000").rstrip("/")
+ENCRYPTION_KEY = os.getenv("WP_ENCRYPTION_KEY", "3NoHR8z7BfxG4EIQUnjTzvZ6h5WCog1S").encode()
 
 if auth_header := os.getenv("WP_AUTH_HEADER"):
     DASHBOARD_AUTH = auth_header
@@ -63,6 +66,31 @@ redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
 def build_url(base_path: str, workflow_url: str, identifier: Optional[str] = None) -> str:
     """Appends the identifier segment when present: /base/path[/identifier]"""
     return f"{base_path}{workflow_url}/{identifier}" if identifier else f"{base_path}{workflow_url}"
+
+
+def _decrypt_field(encrypted_string: str) -> object:
+    """Decrypt an AES-256-GCM value stored as ivHex:authTagBase64:encryptedBase64."""
+    iv_hex, auth_tag_b64, encrypted_b64 = encrypted_string.strip().split(":")
+    iv = bytes.fromhex(iv_hex)
+    auth_tag = base64.b64decode(auth_tag_b64)
+    ciphertext = base64.b64decode(encrypted_b64)
+    aesgcm = AESGCM(ENCRYPTION_KEY)
+    # cryptography expects ciphertext with the 16-byte tag appended
+    decrypted = aesgcm.decrypt(iv, ciphertext + auth_tag, None)
+    return json.loads(decrypted.decode("utf-8"))
+
+
+def try_decrypt(value: Optional[str]) -> object:
+    if not value:
+        return None
+    try:
+        return _decrypt_field(value)
+    except Exception:
+        # Value may be stored as plain-text JSON — try to parse it directly
+        try:
+            return json.loads(value)
+        except Exception:
+            return {"_decryption_failed": True, "raw": value}
 
 
 async def get_workflows() -> list[dict]:
@@ -109,11 +137,12 @@ async def list_workflows() -> str:
 @mcp.tool()
 async def search_workflows(q: str) -> str:
     """Search workflows by keyword. Matches against workflow id and url (case-insensitive)."""
-    async with httpx.AsyncClient(headers=DASHBOARD_HEADERS, timeout=30) as client:
-        res = await client.get(f"{BASE_URL}/api/workflows/search", params={"q": q})
-        res.raise_for_status()
-        results: list[dict] = res.json()["data"]
-
+    workflows = await get_workflows()
+    q_lower = q.lower().strip()
+    results = [
+        w for w in workflows
+        if q_lower in w["id"].lower() or q_lower in w["url"].lower()
+    ]
     if not results:
         return f'No workflows found matching "{q}"'
     return json.dumps(results, indent=2)
@@ -178,27 +207,43 @@ async def get_config(workflow_id: str, identifier: Optional[str] = None) -> str:
 async def get_config_decrypted(workflow_id: str, identifier: Optional[str] = None) -> str:
     """
     Get fully decrypted config including secret values (API keys, passwords) for a workflow.
-    Only works in non-production environments. Use this to verify what is actually stored.
+    Decryption happens locally in the MCP server using WP_ENCRYPTION_KEY — no backend
+    dev-only route required, works in all environments.
     """
-    params: dict[str, str] = {"workflowId": workflow_id}
-    if identifier:
-        params["identifier"] = identifier
-
+    workflow = await resolve_workflow(workflow_id)
     async with httpx.AsyncClient(headers=DASHBOARD_HEADERS, timeout=30) as client:
-        res = await client.get(f"{BASE_URL}/api/dev/config-decrypt", params=params)
+        res = await client.get(f"{BASE_URL}/api/config{workflow['url']}")
+        res.raise_for_status()
+        configs: list[dict] = res.json()["data"]
 
-    if res.status_code == 404:
-        sys.stderr.write(
-            f"[get_config_decrypted] 404 for workflow='{workflow_id}' identifier='{identifier}' — "
-            "endpoint not available in this environment\n"
-        )
-        return (
-            "get_config_decrypted is only available in non-production environments. "
-            "Use get_config to view non-secret config values."
-        )
+    if not configs:
+        return f"No configs found for workflow '{workflow_id}'"
 
-    res.raise_for_status()
-    return json.dumps(res.json()["data"], indent=2)
+    # Match by identifier (None == default config)
+    match = next(
+        (c for c in configs if c.get("identifier") == identifier),
+        None,
+    )
+    if not match:
+        msg = (
+            f"No config found for workflow '{workflow_id}' with identifier '{identifier}'"
+            if identifier
+            else f"No default config found for workflow '{workflow_id}'"
+        )
+        return msg
+
+    return json.dumps(
+        {
+            "workflowId": workflow_id,
+            "identifier": match.get("identifier"),
+            "updated_at": match.get("updated_at"),
+            "updated_by": match.get("updated_by"),
+            "authcredentials": try_decrypt(match.get("authcredentials")),
+            "config": try_decrypt(match.get("config")),
+            "secret_config": try_decrypt(match.get("secret_config")),
+        },
+        indent=2,
+    )
 
 
 @mcp.tool()
