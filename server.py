@@ -26,6 +26,7 @@ import sys
 from typing import Optional
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from rapidfuzz import fuzz
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -134,17 +135,36 @@ async def list_workflows() -> str:
     return json.dumps(workflows, indent=2)
 
 
+SEARCH_SCORE_THRESHOLD = 60  # 0–100; lower = more permissive
+
 @mcp.tool()
 async def search_workflows(q: str) -> str:
-    """Search workflows by keyword. Matches against workflow id and url (case-insensitive)."""
+    """
+    Search workflows by keyword using fuzzy matching.
+    Scores each workflow's id and url against the query, returns results ranked by relevance.
+    Handles partial matches, typos, and hyphenated names.
+    """
     workflows = await get_workflows()
     q_lower = q.lower().strip()
-    results = [
-        w for w in workflows
-        if q_lower in w["id"].lower() or q_lower in w["url"].lower()
-    ]
-    if not results:
+
+    scored = []
+    for w in workflows:
+        score = max(
+            fuzz.partial_ratio(q_lower, w["id"].lower()),
+            fuzz.partial_ratio(q_lower, w["url"].lower()),
+            fuzz.token_set_ratio(q_lower, w["id"].lower()),
+        )
+        if score >= SEARCH_SCORE_THRESHOLD:
+            scored.append((score, w))
+
+    if not scored:
         return f'No workflows found matching "{q}"'
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    results = [
+        {**w, "_score": score}
+        for score, w in scored
+    ]
     return json.dumps(results, indent=2)
 
 
