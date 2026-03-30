@@ -58,9 +58,9 @@ DASHBOARD_HEADERS = {
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 WORKFLOW_CACHE_KEY = "mcp:workflow-registry"
-WORKFLOW_CACHE_TTL = 120  # 2 minutes
+WORKFLOW_CACHE_TTL = 60  # 1 minute
 CONFIG_CACHE_KEY_PREFIX = "mcp:configs"
-CONFIG_CACHE_TTL = 120  # 2 minutes
+CONFIG_CACHE_TTL = 60  # 1 minute
 
 redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
 
@@ -73,7 +73,7 @@ def build_url(base_path: str, workflow_url: str, identifier: Optional[str] = Non
 
 def _decrypt_field(encrypted_string: str) -> object:
     """Decrypt an AES-256-GCM value stored as ivHex:authTagBase64:encryptedBase64."""
-    iv_hex, auth_tag_b64, encrypted_b64 = encrypted_string.strip().split(":")
+    iv_hex, auth_tag_b64, encrypted_b64 = encrypted_string.strip().split(":", 2)
     iv = bytes.fromhex(iv_hex)
     auth_tag = base64.b64decode(auth_tag_b64)
     ciphertext = base64.b64decode(encrypted_b64)
@@ -86,10 +86,13 @@ def _decrypt_field(encrypted_string: str) -> object:
 def try_decrypt(value: Optional[str]) -> object:
     if not value:
         return None
+    # API may already return a decoded object (dict/list) — pass it through
+    if isinstance(value, (dict, list)):
+        return value
     try:
         return _decrypt_field(value)
     except Exception:
-        # Value may be stored as plain-text JSON — try to parse it directly
+        # Value may be stored as plain-text JSON string — try to parse it directly
         try:
             return json.loads(value)
         except Exception:
