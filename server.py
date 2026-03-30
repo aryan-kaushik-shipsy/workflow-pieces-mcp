@@ -58,7 +58,9 @@ DASHBOARD_HEADERS = {
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 WORKFLOW_CACHE_KEY = "mcp:workflow-registry"
-WORKFLOW_CACHE_TTL = 300  # 5 minutes
+WORKFLOW_CACHE_TTL = 120  # 2 minutes
+CONFIG_CACHE_KEY_PREFIX = "mcp:configs"
+CONFIG_CACHE_TTL = 120  # 2 minutes
 
 redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
 
@@ -106,6 +108,25 @@ async def get_workflows() -> list[dict]:
 
     await redis_client.setex(WORKFLOW_CACHE_KEY, WORKFLOW_CACHE_TTL, json.dumps(workflows))
     return workflows
+
+
+async def get_configs(workflow_url: str) -> list[dict]:
+    cache_key = f"{CONFIG_CACHE_KEY_PREFIX}:{workflow_url}"
+    cached = await redis_client.get(cache_key)
+    if cached:
+        return json.loads(cached)
+
+    async with httpx.AsyncClient(headers=DASHBOARD_HEADERS, timeout=30) as client:
+        res = await client.get(f"{BASE_URL}/api/config{workflow_url}")
+        res.raise_for_status()
+        configs: list[dict] = res.json()["data"]
+
+    await redis_client.setex(cache_key, CONFIG_CACHE_TTL, json.dumps(configs))
+    return configs
+
+
+async def invalidate_config_cache(workflow_url: str) -> None:
+    await redis_client.delete(f"{CONFIG_CACHE_KEY_PREFIX}:{workflow_url}")
 
 
 async def resolve_workflow(workflow_id: str) -> dict:
@@ -189,10 +210,7 @@ async def list_identifiers(workflow_id: str) -> str:
     Each identifier represents a separate client/environment setup.
     """
     workflow = await resolve_workflow(workflow_id)
-    async with httpx.AsyncClient(headers=DASHBOARD_HEADERS, timeout=30) as client:
-        res = await client.get(f"{BASE_URL}/api/config{workflow['url']}")
-        res.raise_for_status()
-        configs: list[dict] = res.json()["data"]
+    configs = await get_configs(workflow["url"])
 
     if not configs:
         return f"No configs found for workflow '{workflow_id}'"
@@ -209,18 +227,28 @@ async def list_identifiers(workflow_id: str) -> str:
 
 
 @mcp.tool()
-async def get_config(workflow_id: str, identifier: Optional[str] = None) -> str:
+async def get_config(workflow_id: str, identifiers: Optional[list[str]] = None) -> str:
     """
-    Get the stored config for a workflow and optional identifier.
-    Returns authcredentials and config.
+    Get the stored configs for a workflow.
+    Returns authcredentials and config for all identifiers (or a filtered subset).
     secret_config is intentionally hidden — use get_config_decrypted if you need the actual secret values.
+
+    identifiers: optional list of identifier strings to return. If omitted, all configs are returned.
+                 Results are served from cache — no redundant API calls when multiple identifiers share the same workflow.
     """
     workflow = await resolve_workflow(workflow_id)
-    url = build_url("/api/config", workflow["url"], identifier)
-    async with httpx.AsyncClient(headers=DASHBOARD_HEADERS, timeout=30) as client:
-        res = await client.get(f"{BASE_URL}{url}")
-        res.raise_for_status()
-    return json.dumps(res.json()["data"], indent=2)
+    configs = await get_configs(workflow["url"])
+
+    if not configs:
+        return f"No configs found for workflow '{workflow_id}'"
+
+    if identifiers is not None:
+        id_set = set(identifiers)
+        configs = [c for c in configs if c.get("identifier") in id_set]
+        if not configs:
+            return f"No configs found for workflow '{workflow_id}' matching identifiers: {identifiers}"
+
+    return json.dumps(configs, indent=2)
 
 
 @mcp.tool()
@@ -231,10 +259,7 @@ async def get_config_decrypted(workflow_id: str, identifier: Optional[str] = Non
     dev-only route required, works in all environments.
     """
     workflow = await resolve_workflow(workflow_id)
-    async with httpx.AsyncClient(headers=DASHBOARD_HEADERS, timeout=30) as client:
-        res = await client.get(f"{BASE_URL}/api/config{workflow['url']}")
-        res.raise_for_status()
-        configs: list[dict] = res.json()["data"]
+    configs = await get_configs(workflow["url"])
 
     if not configs:
         return f"No configs found for workflow '{workflow_id}'"
@@ -311,20 +336,16 @@ async def set_config(
 
     config_url = build_url("/api/config", workflow["url"], identifier)
 
-    # Check if config exists to decide POST vs PUT
+    # Check if config exists to decide POST vs PUT — reuse cached configs
     existing = None
     try:
-        async with httpx.AsyncClient(headers=DASHBOARD_HEADERS, timeout=30) as client:
-            check_res = await client.get(f"{BASE_URL}{config_url}")
-            check_res.raise_for_status()
-            configs = check_res.json()["data"]
-        if isinstance(configs, list):
-            existing = next(
-                (c for c in configs if c["identifier"] == (identifier or None)),
-                None,
-            )
+        all_configs = await get_configs(workflow["url"])
+        existing = next(
+            (c for c in all_configs if c["identifier"] == (identifier or None)),
+            None,
+        )
     except Exception:
-        pass  # 404 — no config yet, proceed with POST
+        pass  # No configs yet or cache miss — proceed with POST
 
     body: dict = {"authcredentials": authcredentials, "config": config}
     if secret_config:
@@ -336,6 +357,8 @@ async def set_config(
         else:
             res = await client.post(f"{BASE_URL}{config_url}", json=body)
         res.raise_for_status()
+
+    await invalidate_config_cache(workflow["url"])
 
     action = "updated" if existing else "created"
     return f"Config {action} successfully.\n\n{json.dumps(res.json(), indent=2)}"
