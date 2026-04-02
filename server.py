@@ -99,10 +99,11 @@ def try_decrypt(value: Optional[str]) -> object:
             return {"_decryption_failed": True, "raw": value}
 
 
-async def get_workflows() -> list[dict]:
-    cached = await redis_client.get(WORKFLOW_CACHE_KEY)
-    if cached:
-        return json.loads(cached)
+async def get_workflows(skip_cache: bool = False) -> list[dict]:
+    if not skip_cache:
+        cached = await redis_client.get(WORKFLOW_CACHE_KEY)
+        if cached:
+            return json.loads(cached)
 
     async with httpx.AsyncClient(headers=DASHBOARD_HEADERS, timeout=30) as client:
         res = await client.get(f"{BASE_URL}/api/workflows")
@@ -153,22 +154,26 @@ mcp = FastMCP("workflow-pieces")
 
 
 @mcp.tool()
-async def list_workflows() -> str:
-    """List all registered workflows with their id, url, HTTP method, and execution mode."""
-    workflows = await get_workflows()
+async def list_workflows(skip_cache: bool = False) -> str:
+    """
+    List all registered workflows with their id, url, HTTP method, and execution mode.
+    Set skip_cache=true to bypass Redis and fetch fresh data from the API.
+    """
+    workflows = await get_workflows(skip_cache=skip_cache)
     return json.dumps(workflows, indent=2)
 
 
 SEARCH_SCORE_THRESHOLD = 60  # 0–100; lower = more permissive
 
 @mcp.tool()
-async def search_workflows(q: str) -> str:
+async def search_workflows(q: str, skip_cache: bool = False) -> str:
     """
     Search workflows by keyword using fuzzy matching.
     Scores each workflow's id and url against the query, returns results ranked by relevance.
     Handles partial matches, typos, and hyphenated names.
+    Set skip_cache=true to bypass Redis and fetch fresh data from the API.
     """
-    workflows = await get_workflows()
+    workflows = await get_workflows(skip_cache=skip_cache)
     q_lower = q.lower().strip()
 
     scored = []
