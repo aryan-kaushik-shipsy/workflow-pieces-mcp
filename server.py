@@ -79,8 +79,11 @@ async def get_db_pool() -> asyncpg.Pool:
     global _db_pool
     if _db_pool is None:
         if not DATABASE_URL:
-            raise RuntimeError("DATABASE_URL env var is not set")
-        _db_pool = await asyncpg.create_pool(DATABASE_URL)
+            raise RuntimeError("DATABASE_URL env var is not set — add it to your .mcp.json env block")
+        try:
+            _db_pool = await asyncpg.create_pool(DATABASE_URL)
+        except Exception as e:
+            raise RuntimeError(f"Could not connect to database: {e}") from e
     return _db_pool
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -472,19 +475,24 @@ async def get_config_decrypted_from_db(workflow_id: str, identifier: Optional[st
 
     identifier: the config identifier to fetch. If omitted, fetches the row where identifier IS NULL.
     """
-    pool = await get_db_pool()
-    async with pool.acquire() as conn:
-        if identifier is not None:
-            row = await conn.fetchrow(
-                "SELECT * FROM credentials WHERE workflow_id = $1 AND identifier = $2",
-                workflow_id,
-                identifier,
-            )
-        else:
-            row = await conn.fetchrow(
-                "SELECT * FROM credentials WHERE workflow_id = $1 AND identifier IS NULL",
-                workflow_id,
-            )
+    try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            if identifier is not None:
+                row = await conn.fetchrow(
+                    "SELECT * FROM credentials WHERE workflow_id = $1 AND identifier = $2",
+                    workflow_id,
+                    identifier,
+                )
+            else:
+                row = await conn.fetchrow(
+                    "SELECT * FROM credentials WHERE workflow_id = $1 AND identifier IS NULL",
+                    workflow_id,
+                )
+    except RuntimeError:
+        raise  # already has a clean message from get_db_pool
+    except Exception as e:
+        return f"Database error while fetching credentials for '{workflow_id}': {e}"
 
     if not row:
         suffix = f" with identifier '{identifier}'" if identifier else " (no identifier / default)"
