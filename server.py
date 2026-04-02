@@ -506,7 +506,6 @@ async def health_check() -> str:
     return json.dumps({"overall": overall, **results}, indent=2)
 
 
-@mcp.tool()
 async def get_config_decrypted_from_db(workflow_id: str, identifier: Optional[str] = None) -> str:
     """
     Fetch and decrypt credentials directly from the database, bypassing the API and Redis cache.
