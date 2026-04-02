@@ -22,6 +22,7 @@ Run (SSE, for browser / remote clients):
 import base64
 import json
 import os
+import re
 import sys
 from typing import Optional
 
@@ -73,6 +74,15 @@ redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
 
 DATABASE_URL = os.getenv("DATABASE_URL")  # postgresql://user:pass@host:port/dbname
 _db_pool: Optional[asyncpg.Pool] = None
+
+
+def _require_select(sql: str) -> None:
+    """Raise if *sql* is not a read-only SELECT (or WITH … SELECT) statement."""
+    first_word = re.split(r"\s+", sql.strip().lstrip("("))[0].upper()
+    if first_word not in ("SELECT", "WITH"):
+        raise ValueError(
+            f"Only SELECT queries are permitted on this connection; rejected: {sql[:80]!r}"
+        )
 
 
 async def get_db_pool() -> asyncpg.Pool:
@@ -497,6 +507,7 @@ async def health_check() -> str:
         try:
             pool = await get_db_pool()
             async with pool.acquire() as conn:
+                _require_select("SELECT 1")
                 await conn.fetchval("SELECT 1")
             results["postgres"] = {"status": "ok"}
         except Exception as e:
@@ -518,16 +529,13 @@ async def get_config_decrypted_from_db(workflow_id: str, identifier: Optional[st
         pool = await get_db_pool()
         async with pool.acquire() as conn:
             if identifier is not None:
-                row = await conn.fetchrow(
-                    "SELECT * FROM credentials WHERE workflow_id = $1 AND identifier = $2",
-                    workflow_id,
-                    identifier,
-                )
+                _q = "SELECT * FROM credentials WHERE workflow_id = $1 AND identifier = $2"
+                _require_select(_q)
+                row = await conn.fetchrow(_q, workflow_id, identifier)
             else:
-                row = await conn.fetchrow(
-                    "SELECT * FROM credentials WHERE workflow_id = $1 AND identifier IS NULL",
-                    workflow_id,
-                )
+                _q = "SELECT * FROM credentials WHERE workflow_id = $1 AND identifier IS NULL"
+                _require_select(_q)
+                row = await conn.fetchrow(_q, workflow_id)
     except RuntimeError:
         raise  # already has a clean message from get_db_pool
     except Exception as e:
