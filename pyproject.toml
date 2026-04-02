@@ -11,4 +11,5 @@ dependencies = [
     "redis>=5.0.0",
     "cryptography>=42.0.0",
     "rapidfuzz>=3.14.3",
+    "asyncpg>=0.29.0",
 ]

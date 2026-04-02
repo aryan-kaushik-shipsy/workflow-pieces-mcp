@@ -31,6 +31,7 @@ from rapidfuzz import fuzz
 from dotenv import load_dotenv
 load_dotenv()
 
+import asyncpg
 import httpx
 import redis.asyncio as aioredis
 from mcp.server.fastmcp import FastMCP
@@ -38,7 +39,11 @@ from mcp.server.fastmcp import FastMCP
 # ─── Config ───────────────────────────────────────────────────────────────────
 
 BASE_URL = os.getenv("WP_BASE_URL", "http://localhost:3000").rstrip("/")
-ENCRYPTION_KEY = os.getenv("WP_ENCRYPTION_KEY", "3NoHR8z7BfxG4EIQUnjTzvZ6h5WCog1S").encode()
+_encryption_key_raw = os.getenv("WP_ENCRYPTION_KEY")
+if not _encryption_key_raw:
+    sys.stderr.write("WP_ENCRYPTION_KEY env var is not set\n")
+    sys.exit(1)
+ENCRYPTION_KEY = _encryption_key_raw.encode()
 
 if auth_header := os.getenv("WP_AUTH_HEADER"):
     DASHBOARD_AUTH = auth_header
@@ -63,6 +68,20 @@ CONFIG_CACHE_KEY_PREFIX = "mcp:configs"
 CONFIG_CACHE_TTL = 60  # 1 minute
 
 redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
+
+# ─── Postgres (direct DB access) ──────────────────────────────────────────────
+
+DATABASE_URL = os.getenv("DATABASE_URL")  # postgresql://user:pass@host:port/dbname
+_db_pool: Optional[asyncpg.Pool] = None
+
+
+async def get_db_pool() -> asyncpg.Pool:
+    global _db_pool
+    if _db_pool is None:
+        if not DATABASE_URL:
+            raise RuntimeError("DATABASE_URL env var is not set")
+        _db_pool = await asyncpg.create_pool(DATABASE_URL)
+    return _db_pool
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -114,11 +133,12 @@ async def get_workflows(skip_cache: bool = False) -> list[dict]:
     return workflows
 
 
-async def get_configs(workflow_url: str) -> list[dict]:
+async def get_configs(workflow_url: str, skip_cache: bool = False) -> list[dict]:
     cache_key = f"{CONFIG_CACHE_KEY_PREFIX}:{workflow_url}"
-    cached = await redis_client.get(cache_key)
-    if cached:
-        return json.loads(cached)
+    if not skip_cache:
+        cached = await redis_client.get(cache_key)
+        if cached:
+            return json.loads(cached)
 
     async with httpx.AsyncClient(headers=DASHBOARD_HEADERS, timeout=30) as client:
         res = await client.get(f"{BASE_URL}/api/config{workflow_url}")
@@ -260,14 +280,27 @@ async def get_config(workflow_id: str, identifiers: Optional[list[str]] = None) 
 
 
 @mcp.tool()
-async def get_config_decrypted(workflow_id: str, identifier: Optional[str] = None) -> str:
+async def get_config_decrypted(
+    workflow_id: str,
+    identifier: Optional[str] = None,
+    use_db: bool = False,
+    skip_cache: bool = False,
+) -> str:
     """
     Get fully decrypted config including secret values (API keys, passwords) for a workflow.
-    Decryption happens locally in the MCP server using WP_ENCRYPTION_KEY — no backend
-    dev-only route required, works in all environments.
+    Decryption happens locally in the MCP server using WP_ENCRYPTION_KEY.
+
+    use_db: set to true to fetch directly from the database instead of the API/cache.
+            Requires DATABASE_URL to be set. Useful when the API is unavailable or you
+            need guaranteed fresh data.
+    skip_cache: set to true to bypass Redis and fetch fresh data from the API.
+                Ignored when use_db=true (DB path never uses cache).
     """
+    if use_db:
+        return await get_config_decrypted_from_db(workflow_id, identifier)
+
     workflow = await resolve_workflow(workflow_id)
-    configs = await get_configs(workflow["url"])
+    configs = await get_configs(workflow["url"], skip_cache=skip_cache)
 
     if not configs:
         return f"No configs found for workflow '{workflow_id}'"
@@ -427,6 +460,47 @@ async def trigger_workflow(
         f"Workflow triggered successfully.\n\n"
         f"Status: {res.status_code}\n\n"
         f"Response:\n{json.dumps(res.json(), indent=2)}"
+    )
+
+
+@mcp.tool()
+async def get_config_decrypted_from_db(workflow_id: str, identifier: Optional[str] = None) -> str:
+    """
+    Fetch and decrypt credentials directly from the database, bypassing the API and Redis cache.
+    Useful when the API is unavailable or you need guaranteed fresh data.
+    Requires DATABASE_URL to be set.
+
+    identifier: the config identifier to fetch. If omitted, fetches the row where identifier IS NULL.
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        if identifier is not None:
+            row = await conn.fetchrow(
+                "SELECT * FROM credentials WHERE workflow_id = $1 AND identifier = $2",
+                workflow_id,
+                identifier,
+            )
+        else:
+            row = await conn.fetchrow(
+                "SELECT * FROM credentials WHERE workflow_id = $1 AND identifier IS NULL",
+                workflow_id,
+            )
+
+    if not row:
+        suffix = f" with identifier '{identifier}'" if identifier else " (no identifier / default)"
+        return f"No credentials found in DB for workflow '{workflow_id}'{suffix}"
+
+    return json.dumps(
+        {
+            "workflowId": workflow_id,
+            "identifier": row["identifier"],
+            "updated_at": str(row["updated_at"]),
+            "updated_by": row["updated_by"],
+            "authcredentials": try_decrypt(row["authcredentials"]),
+            "config": try_decrypt(row["config"]),
+            "secret_config": try_decrypt(row["secret_config"]),
+        },
+        indent=2,
     )
 
 
