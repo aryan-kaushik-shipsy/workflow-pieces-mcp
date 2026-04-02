@@ -63,9 +63,9 @@ DASHBOARD_HEADERS = {
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 WORKFLOW_CACHE_KEY = "mcp:workflow-registry"
-WORKFLOW_CACHE_TTL = 60  # 1 minute
+WORKFLOW_CACHE_TTL = 1800  # 30 minutes
 CONFIG_CACHE_KEY_PREFIX = "mcp:configs"
-CONFIG_CACHE_TTL = 60  # 1 minute
+CONFIG_CACHE_TTL = 1800  # 30 minutes
 
 redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
 
@@ -464,6 +464,46 @@ async def trigger_workflow(
         f"Status: {res.status_code}\n\n"
         f"Response:\n{json.dumps(res.json(), indent=2)}"
     )
+
+
+@mcp.tool()
+async def health_check() -> str:
+    """
+    Ping all dependencies — API (with auth), Redis, and Postgres — and return the status of each.
+    Use this to debug connection issues before calling other tools.
+    """
+    results = {}
+
+    # API
+    try:
+        async with httpx.AsyncClient(headers=DASHBOARD_HEADERS, timeout=10) as client:
+            res = await client.get(f"{BASE_URL}/api/workflows")
+            res.raise_for_status()
+        results["api"] = {"status": "ok", "url": BASE_URL}
+    except Exception as e:
+        results["api"] = {"status": "error", "url": BASE_URL, "error": str(e)}
+
+    # Redis
+    try:
+        await redis_client.ping()
+        results["redis"] = {"status": "ok", "url": REDIS_URL}
+    except Exception as e:
+        results["redis"] = {"status": "error", "url": REDIS_URL, "error": str(e)}
+
+    # Postgres
+    if not DATABASE_URL:
+        results["postgres"] = {"status": "not_configured", "detail": "DATABASE_URL not set"}
+    else:
+        try:
+            pool = await get_db_pool()
+            async with pool.acquire() as conn:
+                await conn.fetchval("SELECT 1")
+            results["postgres"] = {"status": "ok"}
+        except Exception as e:
+            results["postgres"] = {"status": "error", "error": str(e)}
+
+    overall = "ok" if all(v["status"] == "ok" for v in results.values()) else "degraded"
+    return json.dumps({"overall": overall, **results}, indent=2)
 
 
 @mcp.tool()
