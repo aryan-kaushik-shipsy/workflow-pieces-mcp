@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "workflow-pieces": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--project",
+        "/path/to/mcp",
+        "python",
+        "/path/to/mcp/server.py"
+      ],
+      "env": {
+        "WP_BASE_URL": "http://localhost:3000",
+        "WP_AUTH_HEADER": "Basic <base64-encoded-credentials>",
+        "WP_ENCRYPTION_KEY": "<your-32-char-encryption-key>",
+        "REDIS_URL": "redis://localhost:6379",
+        "DATABASE_URL": "postgresql://user:password@host:5432/dbname"
+      }
+    }
+  }
+}
